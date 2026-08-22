@@ -5,34 +5,30 @@ const pool = require("../database/db");
  * BUSCAR DADOS DA CONTA
  * ===================================================
  */
-function buscarConta(req, res) {
-
+async function buscarConta(req, res) {
     try {
-
-        // Procura a conta pelo ID que veio do JWT
-        const conta = contas.find(
-            conta => conta.id === req.usuario.id
+        const resultado = await pool.query(
+            `
+            SELECT id, nome, email, saldo
+            FROM usuarios
+            WHERE id = $1
+            `,
+            [req.usuario.id]
         );
 
-        // SEGURANÇA 
-        if (!conta) {
+        if (resultado.rows.length === 0) {
             return res.status(404).json({
                 erro: "Conta não encontrada"
             });
         }
 
-        // RETORNA APENAS DADOS PÚBLICOS
         return res.status(200).json({
-            id: conta.id,
-            nome: conta.nome,
-            email: conta.email,
-            saldo: conta.saldo
+            ...resultado.rows[0],
+            saldo: Number(resultado.rows[0].saldo)
         });
 
     } catch (erro) {
-
         console.error(erro);
-
         return res.status(500).json({
             erro: "Erro interno do servidor"
         });
@@ -44,62 +40,64 @@ function buscarConta(req, res) {
  * DEPÓSITO
  * ===================================================
  */
-
-function depositar(req, res) {
+async function depositar(req, res) {
+    const client = await pool.connect();
 
     try {
+        const { valor } = req.body;
+        const valorNumerico = Number(valor);
 
-        const { valor } =req.body;
-
-        if (!valor || valor <= 0) {
+        if (!valorNumerico || valorNumerico <= 0) {
             return res.status(400).json({
                 erro: "Valor inválido para depósito"
             });
         }
 
-        
-        const conta = contas.find(
-            conta => conta.id === req.usuario.id
+        await client.query('BEGIN');
+
+        // Atualiza o saldo
+        const resultado = await client.query(
+            `
+            UPDATE usuarios
+            SET saldo = saldo + $1
+            WHERE id = $2
+            RETURNING saldo
+            `,
+            [valorNumerico, req.usuario.id]
         );
 
-        if (!conta) {
+        if (resultado.rows.length === 0) {
+            await client.query('ROLLBACK');
             return res.status(404).json({
                 erro: "Conta não encontrada"
             });
         }
 
-        // -------------------------
-        // REALIZA DEPÓSITO
-        // -------------------------
-        conta.saldo += Number(valor);
+        // Registra a movimentação
+        await client.query(
+            `
+            INSERT INTO movimentacoes (usuario_id, tipo, valor)
+            VALUES ($1, $2, $3)
+            `,
+            [req.usuario.id, "DEPOSITO", valorNumerico]
+        );
 
-        // -------------------------
-        // REGISTRA MOVIMENTAÇÕES
-        // -------------------------
-        conta.extrato.push({
-            tipo: "DEPOSITO",
-            valor: Number(valor),
-            data: new Date()
-        });
+        await client.query('COMMIT');
 
-        // -------------------------
-        // RETORNA NOVO SALDO
-        // -------------------------
         return res.status(200).json({
             mensagem: "Depósito realizado com sucesso",
-            saldo: conta.saldo
+            saldo: Number(resultado.rows[0].saldo)
         });
 
     } catch (erro) {
-
+        await client.query('ROLLBACK');
         console.error(erro);
-
         return res.status(500).json({
             erro: "Erro interno do servidor"
         });
-
+    } finally {
+        client.release();
     }
-
 }
 
 /**
@@ -107,72 +105,84 @@ function depositar(req, res) {
  * SAQUE
  * ===================================================
  */
-function sacar(req, res) {
+async function sacar(req, res) {
+    const client = await pool.connect();
 
     try {
-
         const { valor } = req.body;
+        const valorNumerico = Number(valor);
 
-        // -------------------------
-        // VALIDAÇÃO DO VALOR
-        // -------------------------
-        if (!valor || valor <= 0) {
+        if (!valorNumerico || valorNumerico <= 0) {
             return res.status(400).json({
                 erro: "Valor inválido para saque"
             });
         }
 
-        // -------------------------
-        // PROCURA CONTA
-        // -------------------------
-        const conta = contas.find(
-            conta => conta.id === req.usuario.id
+        await client.query('BEGIN');
+
+        // Busca o saldo atual do usuário para validar
+        const usuario = await client.query(
+            `
+            SELECT saldo 
+            FROM usuarios 
+            WHERE id = $1
+            `,
+            [req.usuario.id]
         );
 
-        if (!conta) {
+        if (usuario.rows.length === 0) {
+            await client.query('ROLLBACK');
             return res.status(404).json({
                 erro: "Conta não encontrada"
             });
         }
 
-        // -------------------------
-        // SALDO INSUFICIENTE
-        // -------------------------
-        if (Number(valor) > conta.saldo) {
+        const saldoAtual = Number(usuario.rows[0].saldo);
+
+        // Valida se o usuário tem saldo suficiente
+        if (valorNumerico > saldoAtual) {
+            await client.query('ROLLBACK');
             return res.status(400).json({
                 erro: "Saldo insuficiente"
             });
         }
 
-        // -------------------------
-        // REALIZA SAQUE
-        // -------------------------
-        conta.saldo -= Number(valor);
+        // Atualiza o saldo subtraindo o valor
+        const resultado = await client.query(
+            `
+            UPDATE usuarios
+            SET saldo = saldo - $1
+            WHERE id = $2
+            RETURNING saldo
+            `,
+            [valorNumerico, req.usuario.id]
+        );
 
-        conta.extrato.push({
-            tipo: "SAQUE",
-            valor: Number(valor),
-            dara: new Date()
-        });
+        // Registra a movimentação de SAQUE
+        await client.query(
+            `
+            INSERT INTO movimentacoes (usuario_id, tipo, valor)
+            VALUES ($1, $2, $3)
+            `,
+            [req.usuario.id, "SAQUE", valorNumerico]
+        );
 
-        // -------------------------
-        // RETORNA NOVO SALDO
-        // -------------------------
+        await client.query('COMMIT');
+
         return res.status(200).json({
             mensagem: "Saque realizado com sucesso",
-            saldo: conta.saldo
+            saldo: Number(resultado.rows[0].saldo)
         });
 
     } catch (erro) {
-
+        await client.query('ROLLBACK');
         console.error(erro);
-
         return res.status(500).json({
             erro: "Erro interno do servidor"
         });
-
+    } finally {
+        client.release();
     }
-
 }
 
 /**
@@ -180,113 +190,100 @@ function sacar(req, res) {
  * TRANSFERÊNCIA
  * ===================================================
  */
-function transferir(req, res) {
+async function transferir(req, res) {
+    const client = await pool.connect();
 
     try {
-
         const { contaDestino, valor } = req.body;
+        const usuarioOrigemId = req.usuario.id;
+        const valorNumerico = Number(valor);
 
-        // -------------------------
-        // VALIDAÇÃO DOS DADOS
-        // -------------------------
-        if (!contaDestino || !valor || valor <= 0) {
+        // Validação: Valor precisa ser maior que zero e ter conta de destino
+        if (!contaDestino || !valorNumerico || valorNumerico <= 0) {
             return res.status(400).json({
                 erro: "Dados inválidos para transferência"
             });
         }
-
-        // -------------------------
-        // CONTA DE ORIGEM
-        // -------------------------
-        const contaOrigem = contas.find(
-            conta => conta.id === req.usuario.id
-        );
-
-        if (!contaOrigem) {
-            return res.status(404).json({
-                erro: "Conta de origem não encontrada"
-            });
-        }
-
-        // -------------------------
-        // CONTA DE DESTINO
-        // -------------------------
-        const contaDestinoEncontrada = contas.find(
-            conta => conta.id === Number(contaDestino)
-        );
-
-        if (!contaDestinoEncontrada) {
-            return res.status(404).json({
-                erro: "Conta de destino não encontrada"
-            });
-        }
-
-        // -------------------------
-        // NÃO PERMITE TRANSFERIR
-        // PARA SI MESMO
-        // -------------------------
-        if (contaOrigem.id === contaDestinoEncontrada.id) {
+        
+        // Validação: Impedir transferir para a própria conta
+        if (Number(contaDestino) === usuarioOrigemId) {
             return res.status(400).json({
                 erro: "Não é possível transferir para a própria conta"
             });
         }
 
-        // -------------------------
-        // SALDO INSUFICIENTE
-        // -------------------------
-        if (Number(valor) > contaOrigem.saldo) {
-            return res.status(400).json({
-                erro: "Saldo insuficiente"
-            });
+        await client.query('BEGIN');
+
+        // Busca o saldo atual do usuário de origem
+        const resOrigem = await client.query(
+            'SELECT saldo FROM usuarios WHERE id = $1',
+            [usuarioOrigemId]
+        );
+
+        if (resOrigem.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ erro: "Conta de origem não encontrada" });
         }
 
-        // -------------------------
-        // REALIZA TRANSFERÊNCIA
-        // -------------------------
-        contaOrigem.saldo -= Number(valor);
+        const saldoOrigem = Number(resOrigem.rows[0].saldo);
 
-        contaDestinoEncontrada.saldo += Number(valor);
+        // Validação: Saldo suficiente
+        if (valorNumerico > saldoOrigem) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ erro: "Saldo insuficiente" });
+        }
 
-        // -------------------------
-        // REGISTRA NO EXTRATO
-        // DA CONTA DE ORIGEM
-        // -------------------------
-        contaOrigem.extrato.push({
-            tipo: "TRANSFERENCIA",
-            valor: Number(valor),
-            destino: contaDestinoEncontrada.id,
-            data: new Date()
-        });
+        // Valida se a conta de destino existe
+        const resDestino = await client.query(
+            'SELECT id FROM usuarios WHERE id = $1',
+            [contaDestino]
+        );
 
-        // -------------------------
-        // REGISTRA NO EXTRATO
-        // DA CONTA DESTINO
-        // -------------------------
-        contaDestinoEncontrada.extrato.push({
-            tipo: "TRANSFERENCIA_RECEBIDA",
-            valor: Number(valor),
-            origem: contaOrigem.id,
-            data: new Date()
-        });
+        if (resDestino.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ erro: "Conta de destino não encontrada" });
+        }
 
-        // -------------------------
-        // RETORNO
-        // -------------------------
+        // TIRA o dinheiro de quem enviou
+        const resNovoSaldo = await client.query(
+            'UPDATE usuarios SET saldo = saldo - $1 WHERE id = $2 RETURNING saldo',
+            [valorNumerico, usuarioOrigemId]
+        );
+
+        // Adiciona no destino
+        await client.query(
+            'UPDATE usuarios SET saldo = saldo + $1 WHERE id = $2',
+            [valorNumerico, contaDestino]
+        );
+
+        // Registra no extrato de quem ENVIOU
+        await client.query(
+            `INSERT INTO movimentacoes (usuario_id, tipo, valor) 
+             VALUES ($1, $2, $3)`,
+            [usuarioOrigemId, 'TRANSFERENCIA_ENVIADA', valorNumerico]
+        );
+
+        // Registra no extrato de quem RECEBEU
+        await client.query(
+            `INSERT INTO movimentacoes (usuario_id, tipo, valor) 
+             VALUES ($1, $2, $3)`,
+            [contaDestino, 'TRANSFERENCIA_RECEBIDA', valorNumerico]
+        );
+
+        await client.query('COMMIT');
+
         return res.status(200).json({
             mensagem: "Transferência realizada com sucesso",
-            saldoAtual: contaOrigem.saldo
+            saldoAtual: Number(resNovoSaldo.rows[0].saldo)
         });
 
     } catch (erro) {
-
+        await client.query('ROLLBACK');
         console.error(erro);
-
-        return res.status(500).json({
-            erro: "Erro interno do servidor"
-        });
-
+        return res.status(500).json({ erro: "Erro interno do servidor" });
+    } finally {
+        client.release();
     }
-
 }
 
 /**
@@ -294,35 +291,36 @@ function transferir(req, res) {
  * EXTRATO
  * ===================================================
  */
-function consultarExtrato(req, res) {
-
+async function consultarExtrato(req, res) {
     try {
+        const usuarioId = req.usuario.id;
 
-        const conta = contas.find(
-            conta => conta.id === req.usuario.id
+        const resUsuario = await pool.query(
+            'SELECT saldo FROM usuarios WHERE id = $1',
+            [usuarioId]
         );
 
-        if (!conta) {
-            return res.status(404).json({
-                erro: "Conta não encontrada"
-            });
+        if (resUsuario.rows.length === 0) {
+            return res.status(404).json({ erro: "Conta não encontrada" });
         }
 
+        const resMovimentacoes = await pool.query(
+            `SELECT id, tipo, valor, data 
+             FROM movimentacoes 
+             WHERE usuario_id = $1 
+             ORDER BY data DESC`,
+            [usuarioId]
+        );
+
         return res.status(200).json({
-            saldo: conta.saldo,
-            movimentacoes: conta.extrato
+            saldo: Number(resUsuario.rows[0].saldo),
+            movimentacoes: resMovimentacoes.rows
         });
 
     } catch (erro) {
-
         console.error(erro);
-
-        return res.status(500).json({
-            erro: "Erro interno do servidor"
-        });
-
+        return res.status(500).json({ erro: "Erro interno do servidor" });
     }
-
 }
 
 module.exports = {
@@ -331,6 +329,4 @@ module.exports = {
     sacar,
     transferir,
     consultarExtrato
-    
 };
-
